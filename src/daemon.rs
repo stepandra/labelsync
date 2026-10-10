@@ -108,6 +108,7 @@ pub struct Node {
     db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     paused: Arc<AtomicBool>,
     claim_lock: Mutex<()>,
+    howto_lock: Mutex<()>,
     ingest_lock: Mutex<()>,
     materialize_lock: Mutex<()>,
     materialize_notify: Notify,
@@ -190,6 +191,7 @@ impl Node {
             db: Arc::new(std::sync::Mutex::new(conn)),
             paused,
             claim_lock: Mutex::new(()),
+            howto_lock: Mutex::new(()),
             ingest_lock: Mutex::new(()),
             materialize_lock: Mutex::new(()),
             materialize_notify: Notify::new(),
@@ -1032,10 +1034,11 @@ impl Node {
             }
             Request::Release { source_key, agent } => self.release(self.agent_or_default(&agent), source_key).await,
             Request::Sync { action } => self.sync_cmd(&action).await,
-            Request::HowtoPut { source_key, content, agent } => {
-                self.howto_put(self.agent_or_default(&agent), source_key, content).await
+            Request::HowtoPut { source_key, content, agent, base } => {
+                self.howto_put(self.agent_or_default(&agent), source_key, content, base).await
             }
-            Request::HowtoGet { source_key } => self.howto_get(source_key).await,
+            Request::HowtoGet { source_key, version } => self.howto_get(source_key, version).await,
+            Request::HowtoLog { source_key } => self.howto_log(source_key).await,
             Request::Report { source_key, agent, record } => {
                 self.report(self.agent_or_default(&agent), source_key, record).await
             }

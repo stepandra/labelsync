@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+automerge = "0.12"
 blake3 = "1.8.7"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 csv = "1.4.0"
+dissimilar = "1.0.11"
 futures-lite = "2.6.1"
 hex = "0.4.3"
 humantime = "2.4.0"

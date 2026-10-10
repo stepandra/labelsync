@@ -99,17 +99,25 @@ Agents share what works per source: a markdown **playbook** (`howto`), immutable
 ```sh
 labelsync queue add src-a src-b src-c            # or: labelsync queue add --file sources.txt
 labelsync queue list
-labelsync howto put src-a --file playbook.md     # your version (one per agent); stdin works too
-labelsync howto get src-a                        # all versions, newest first: {author, agent, hash, time, content}
+labelsync howto get src-a                        # merged markdown + "version" (Automerge heads)
+labelsync howto put src-a --file playbook.md --base <version>   # full new md; diffed against base, merged with others' edits
+labelsync howto log src-a                        # who changed it, when
+labelsync howto get src-a --version <version>    # render a historical version
 labelsync next [--claim] [--auto-renew]          # exit 0 found/won, 5 nothing free; --sources FILE|- for your own list
-labelsync report src-a --duration-s 540 --errors 2 --retries 5 --method api-v2 --howto-version <hash> --notes "rate limit 5/s"
+labelsync report src-a --duration-s 540 --errors 2 --retries 5 --method api-v2 --howto-version <version> --notes "rate limit 5/s"
 echo '{"duration_s":540,"method":"api-v2","rows_total":1200,"rows_new":300}' | labelsync report src-a --json -
 ```
+
+Playbooks are **co-edited**: one Automerge document per source. `howto put` takes the whole new markdown,
+diffs it against `--base` (the `version` you read; default = current) and applies only the changed spans, so two
+agents editing different parts both keep their edits, even when made offline. Always pass `--base` with the version
+you started from. Without it your text is diffed against the current version and you may undo someone's fresh edit.
 
 `report` fills `rows_total` / `rows_new_after_dedup` automatically from the segments you appended for that
 source since your claim (or since `--started-at`, or `now - duration_s`). Pass them explicitly to override.
 `next` returns `source_key`, `score`, `stats` (`new_per_min`, `error_rate` = errors/run, `last_run_age_s`),
-`best_method`, and `playbook.latest` / `playbook.best` (the version used by the best-yielding run).
+`best_method`, and `playbook.latest` / `playbook.best` (`{version, content}`; `best` is the historical version
+recorded as `--howto-version` by the best-yielding run, rendered from Automerge history).
 Sources without history get an exploration bonus, so they are tried first.
 
 Agent loop, shell:
@@ -118,7 +126,7 @@ Agent loop, shell:
 while out=$(labelsync next --claim --auto-renew); do
   src=$(jq -r .source_key <<<"$out")
   jq -r '.playbook.best.content // .playbook.latest.content // ""' <<<"$out" > /tmp/playbook.md
-  hv=$(jq -r '.playbook.best.hash // .playbook.latest.hash // empty' <<<"$out")
+  hv=$(jq -r '.playbook.latest.version // empty' <<<"$out")    # version you read = edit base + howto_version
   start=$(date +%s)
   ./mine.sh "$src" /tmp/playbook.md > labels.tsv            # your miner; TSV with header
   labelsync append --source-key "$src" < labels.tsv
@@ -145,14 +153,15 @@ while True:
     tsv = mine(src, pb.get("content", ""))      # your code; returns TSV text with header
     ls("append", "--source-key", src, stdin=tsv)
     rec = {"duration_s": time.time() - t0, "errors": errors, "method": "py-miner-v1",
-           "howto_version": pb.get("hash"), "notes": "what I learned"}
+           "howto_version": pb.get("version"), "notes": "what I learned"}
     ls("report", src, "--json", "-", stdin=json.dumps(rec))
     if learned_something:
-        ls("howto", "put", src, stdin=updated_playbook_md)
+        base = (n["playbook"]["latest"] or {}).get("version")
+        ls("howto", "put", src, *(["--base", base] if base else []), stdin=updated_playbook_md)
     ls("done", src)
 ```
 
-SQLite (read-only): `howto`, `runs`, `queue` tables and `source_stats` / `method_stats` views.
+SQLite (read-only): `playbooks` (merged md per source), `runs`, `queue` tables and `source_stats` / `method_stats` views.
 
 ## Input format
 
@@ -239,7 +248,7 @@ Drop files into `<data-dir>/inbox/`. **Write them atomically**: write `name.tsv.
 | `release K` | drop your lease |
 | `sync pause\|resume\|now` | stop / restart network sync (pause also refuses incoming sync connections) |
 | `hash FILE` | BLAKE3 of a file (what `--source-file` computes) |
-| `howto put K [--file F]` / `howto get K` | per-agent markdown playbook for a source |
+| `howto put K [--file F] [--base V]` / `howto get K [--version V]` / `howto log K` | co-edited (Automerge) markdown playbook |
 | `report K [--json F\|-] [--rows-total N] [--rows-new N] [--duration-s S] [--errors N] [--retries N] [--method M] [--howto-version H] [--notes T] [--started-at T]` | immutable run record |
 | `next [--sources F\|-] [--claim] [--auto-renew] [--ttl-secs N]` | best free source + stats + playbook (exit 5 = none) |
 | `queue add K… [--file F\|-] [--source-url U]` / `queue rm K…` / `queue list` | shared source queue |

@@ -23,7 +23,7 @@ and labels do not need concurrent editing.
 | `src/<blake3 of raw source file>` | JSON `{agent, source_key, finished_at}` | the finishing author |
 | `agent/<author hex>` | JSON `{name, node_id, created_at}` | that author (maps author -> agent name) |
 
-| `howto/<enc(source_key)>/` | markdown playbook | one entry per author (latest version per agent) |
+| `howto/<enc(source_key)>/` | Automerge `save()` of the whole playbook doc (legacy: plain md) | one entry per author, each holding that author's full merged doc |
 | `runs/<enc(source_key)>/<enc(agent)>/<ts_ms>/` | JSON run record | the reporting author; immutable (new key per run) |
 | `queue/<enc(source_key)>/` | JSON `{agent, added_at, source_url, removed}` | one entry per author; newest entry across authors decides membership |
 
@@ -77,10 +77,27 @@ always-on node); this is not built.
 
 ## Experience sharing (phase 1.5)
 
-* **Playbooks** are plain per-author entries: each agent keeps one markdown version per source, `howto get` lists all
-  of them newest first. The version id is the BLAKE3 content hash of the entry. Old versions stay readable by hash
-  while their blob is in the store (no GC is configured). **Co-editing one playbook with Automerge is a later upgrade**;
-  for now agents read all versions and merge by hand / by LLM.
+* **Playbooks** are Automerge 0.12 documents (one per source, root key `text` = Text, unicode-code-point indexing).
+  * Transport: each author writes its **full `save()`** of the merged doc under its own `howto/<src>/` entry. Readers load
+    every author's save and `merge` them. Chosen over per-change append logs because it needs no new key scheme, no ordering
+    or gap handling, and a single entry per author can never be "missing a chunk": any one save is a complete doc. Cost:
+    each author entry holds the full history (columnar-compressed; playbooks are KB-sized), and every put leaves the previous
+    blob orphaned in the blob store (no GC). Identical changes in several saves dedupe by change hash.
+  * Genesis: every node starts from the same deterministic change (fixed actor, time 0, creates `text`). Without it, two
+    nodes creating `text` independently would conflict and one text would be hidden.
+  * `put`: fork at `--base` heads (default: current), diff base text → new md with `dissimilar` (char diff), apply as
+    `splice_text` calls in one change, merge into the current doc, save, write. Concurrent edits made after the base are
+    kept. Same-span conflicts are resolved by Automerge's deterministic ordering (both inserts survive, both deletes apply);
+    every node converges on identical text.
+  * Actor per put = author id (32 B) ‖ now_ms (8 B): a fresh actor per change, so editing from an older base never reuses
+    a sequence number. `howto log` maps the actor back to the author/agent.
+  * Version id = sorted change-hash heads, comma-joined. `report --howto-version` records it; `next` renders
+    `playbook.best` at those heads (`text_at`). Unknown/legacy version ids fall back to latest with a `note`.
+  * Migration: phase 1.5 per-author plain-md entries are converted in memory by a deterministic change (fixed actor derived
+    from source key + content, time 0) applied on genesis, using the newest legacy entry, only while no Automerge save exists.
+    The first `put` stores the converted doc. Edge: two nodes that convert *different* newest legacy versions concurrently
+    would both insert their text (duplication, no loss).
+  * Mirrored into SQLite `playbooks(source_key, version, content, ...)`, recomputed only when the set of author entries changes.
 * **Run records** are immutable JSON: `rows_total`, `rows_new_after_dedup`, `duration_s`, `errors`, `retries`, `method`,
   `howto_version`, `notes`, plus `segments`, `started_at`, `ts`, `agent`. If rows are not given, `report` computes them from
   the reporter's own segments for that source written since the run start (claim time, `--started-at`, or now - duration);
@@ -131,5 +148,5 @@ Windows named pipe: TODO.
 * `active_labels` uses correlated subqueries; export of 1M labels takes ~5 s.
 * No per-chain namespaces, no read-only enforcement of SQLite beyond documentation, no metrics endpoint.
 * Phase 3 (generic md/csv file sync) not started.
-* Experience: no Automerge co-editing of playbooks, no per-method playbook link beyond `howto_version`, scoring has no
-  time decay, run records can be faked by any ticket holder, and `next` does not consult `src/` hashes.
+* Experience: scoring has no time decay, run records can be faked by any ticket holder, `next` does not consult `src/`
+  hashes, playbook blobs are never compacted/GC'd, no `howto edit` ($EDITOR) helper.

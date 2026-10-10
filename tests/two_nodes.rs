@@ -269,7 +269,7 @@ fn two_daemons_end_to_end() {
 
     // ---- 7. experience sharing: howto + report on A, visible to B and returned by `next` ----
     a.cli_stdin(&["howto", "put", "q-known"], Some("# q-known playbook\nUse the csv export endpoint, 1 req/s.\n"));
-    let hv = a.cli(&["howto", "get", "q-known"])["versions"][0]["hash"].as_str().unwrap().to_string();
+    let hv = a.cli(&["howto", "get", "q-known"])["version"].as_str().unwrap().to_string();
     assert_eq!(a.cli(&["claim", "q-known"])["result"], "won");
     a.cli_stdin(
         &["append", "--source-key", "q-known", "--chain", "eth"],
@@ -286,12 +286,12 @@ fn two_daemons_end_to_end() {
         let h = b.cli(&["howto", "get", "q-known"]);
         let (code, n) = b.try_cli(&["next"]);
         *last.borrow_mut() = n.clone();
-        h["versions"].as_array().map(|v| v.len()) == Some(1)
+        h["version"] == hv.as_str()
             && code == Some(0)
             && n["source_key"] == "q-known"
             && n["best_method"]["method"] == "csv-export"
             && n["stats"]["runs"] == 1
-            && n["playbook"]["best"]["hash"] == hv.as_str()
+            && n["playbook"]["best"]["version"] == hv.as_str()
             && n["playbook"]["latest"]["content"].as_str().unwrap_or("").contains("csv export")
     }, || last.borrow().to_string());
     let n = last.borrow().clone();
@@ -337,6 +337,39 @@ fn two_daemons_end_to_end() {
     // queue exhausted for a third agent-view: nothing free for A except what A holds
     let (code, _v) = b.try_cli(&["--agent", "third", "next"]);
     assert_eq!(code, Some(5), "no free source left: {_v}");
+
+    // ---- 9. co-edited playbook: both sides edit the same base during a partition ----
+    let base_md = "# arkham playbook\n\nAuth: API key in header.\n\nRate limits: unknown.\n\nPagination: unknown.\n";
+    a.cli_stdin(&["howto", "put", "arkham"], Some(base_md));
+    let base_v = a.cli(&["howto", "get", "arkham"])["version"].as_str().unwrap().to_string();
+    wait_until("B has the playbook base", 60, || b.cli(&["howto", "get", "arkham"])["version"] == base_v.as_str());
+    b.cli(&["sync", "pause"]);
+    thread::sleep(Duration::from_millis(500));
+    let ea = base_md.replace("Rate limits: unknown.", "Rate limits: 5 req/s, 429 means sleep 60s.");
+    let eb = base_md.replace("Pagination: unknown.", "Pagination: cursor param, max 1000 per page.");
+    let pa = a.cli_stdin(&["howto", "put", "arkham", "--base", &base_v], Some(&ea)).1;
+    let pb = b.cli_stdin(&["howto", "put", "arkham", "--base", &base_v], Some(&eb)).1;
+    assert_eq!(pa["changed"], true);
+    assert!(pa["deleted_chars"].as_u64().unwrap() < 20, "minimal splice, not full rewrite: {pa}");
+    assert_eq!(pb["changed"], true);
+    thread::sleep(Duration::from_secs(2));
+    assert!(!a.cli(&["howto", "get", "arkham"])["content"].as_str().unwrap().contains("cursor param"), "partition holds");
+    b.cli(&["sync", "resume"]);
+    let merged = std::cell::RefCell::new(String::new());
+    wait_until_dbg("playbook merged identically on both nodes", 60, || {
+        let x = a.cli(&["howto", "get", "arkham"]);
+        let y = b.cli(&["howto", "get", "arkham"]);
+        *merged.borrow_mut() = format!("A={x}\nB={y}");
+        x["content"] == y["content"] && x["version"] == y["version"]
+            && x["content"].as_str().unwrap().contains("5 req/s, 429 means sleep 60s.")
+            && x["content"].as_str().unwrap().contains("cursor param, max 1000 per page.")
+    }, || merged.borrow().clone());
+    let log = a.cli(&["howto", "log", "arkham"]);
+    let agents: Vec<String> = log["changes"].as_array().unwrap().iter().filter_map(|c| c["agent"].as_str().map(String::from)).collect();
+    assert!(agents.contains(&"hound-a".to_string()) && agents.contains(&"hound-b".to_string()), "{log}");
+    eprintln!("[info] merged playbook:\n{}", a.cli(&["howto", "get", "arkham"])["content"].as_str().unwrap());
+    // historical version still renders
+    assert_eq!(a.cli(&["howto", "get", "arkham", "--version", &base_v])["content"], base_md);
 
     // ---- 6. restart persistence ----
     let expected = b.labels().0;

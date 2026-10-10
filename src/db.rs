@@ -60,13 +60,14 @@ CREATE TABLE IF NOT EXISTS provenance(
   PRIMARY KEY(label_id, author_id, segment_id, op, category, observed_at)
 ) WITHOUT ROWID;
 -- experience sharing (phase 1.5)
-CREATE TABLE IF NOT EXISTS howto(
-  source_key TEXT NOT NULL,
-  author TEXT NOT NULL,
-  hash TEXT NOT NULL,
+DROP TABLE IF EXISTS howto; -- phase 1.5 per-author table, replaced by merged playbooks
+-- merged Automerge playbook per source (version = sorted change-hash heads, comma-separated)
+CREATE TABLE IF NOT EXISTS playbooks(
+  source_key TEXT PRIMARY KEY,
+  version TEXT NOT NULL,
+  sig TEXT NOT NULL,
   ts INTEGER NOT NULL,
-  content TEXT NOT NULL,
-  PRIMARY KEY(source_key, author)
+  content TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs(
   key TEXT PRIMARY KEY,
@@ -292,19 +293,25 @@ pub fn agent_name(conn: &Connection, author: &str) -> Result<Option<String>> {
 
 // ---------- experience sharing ----------
 
-pub fn upsert_howto(conn: &Connection, source_key: &str, author: &str, hash: &str, ts: u64, content: &str) -> Result<()> {
+pub fn upsert_playbook(conn: &Connection, source_key: &str, version: &str, sig: &str, ts: u64, content: &str) -> Result<()> {
     conn.execute(
-        "INSERT INTO howto(source_key,author,hash,ts,content) VALUES(?1,?2,?3,?4,?5)
-         ON CONFLICT(source_key,author) DO UPDATE SET hash=excluded.hash, ts=excluded.ts, content=excluded.content
-         WHERE excluded.ts >= howto.ts",
-        params![source_key, author, hash, ts as i64, content],
+        "INSERT INTO playbooks(source_key,version,sig,ts,content) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(source_key) DO UPDATE SET version=excluded.version, sig=excluded.sig, ts=excluded.ts, content=excluded.content",
+        params![source_key, version, sig, ts as i64, content],
     )?;
     Ok(())
 }
 
-pub fn howto_hash(conn: &Connection, source_key: &str, author: &str) -> Result<Option<String>> {
+pub fn playbook_sig(conn: &Connection, source_key: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT sig FROM playbooks WHERE source_key=?1", [source_key], |r| r.get(0)).optional()?)
+}
+
+/// (version, ts, content)
+pub fn latest_playbook(conn: &Connection, source_key: &str) -> Result<Option<(String, i64, String)>> {
     Ok(conn
-        .query_row("SELECT hash FROM howto WHERE source_key=?1 AND author=?2", [source_key, author], |r| r.get(0))
+        .query_row("SELECT version, ts, content FROM playbooks WHERE source_key=?1", [source_key], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .optional()?)
 }
 
@@ -386,28 +393,6 @@ pub fn best_howto_version(conn: &Connection, source_key: &str) -> Result<Option<
              ORDER BY COALESCE(rows_new,0) * 1.0 / duration_s DESC, ts DESC LIMIT 1",
             [source_key],
             |r| r.get(0),
-        )
-        .optional()?)
-}
-
-pub fn howto_by_hash(conn: &Connection, hash: &str) -> Result<Option<(String, String, i64, String)>> {
-    Ok(conn
-        .query_row(
-            "SELECT h.author, COALESCE(a.name,''), h.ts, h.content FROM howto h LEFT JOIN authors a ON a.author=h.author WHERE h.hash=?1 LIMIT 1",
-            [hash],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .optional()?)
-}
-
-#[allow(clippy::type_complexity)]
-pub fn latest_howto(conn: &Connection, source_key: &str) -> Result<Option<(String, String, String, i64, String)>> {
-    Ok(conn
-        .query_row(
-            "SELECT h.author, COALESCE(a.name,''), h.hash, h.ts, h.content FROM howto h LEFT JOIN authors a ON a.author=h.author
-             WHERE h.source_key=?1 ORDER BY h.ts DESC LIMIT 1",
-            [source_key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()?)
 }

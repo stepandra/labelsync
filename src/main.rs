@@ -183,14 +183,24 @@ enum Cmd {
 
 #[derive(Subcommand, Debug)]
 enum HowtoCmd {
-    /// Store your playbook for a source (from --file or stdin)
+    /// Submit the full new markdown; it is diffed against --base (default: current version)
+    /// and applied as minimal text splices, so concurrent edits elsewhere are kept
     Put {
         source_key: String,
         #[arg(long)]
         file: Option<PathBuf>,
+        /// Version (from `howto get`) your edit started from
+        #[arg(long)]
+        base: Option<String>,
     },
-    /// All versions, newest first
-    Get { source_key: String },
+    /// Merged markdown + version id (or a historical --version)
+    Get {
+        source_key: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Change history: authors, agents, timestamps
+    Log { source_key: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -393,14 +403,15 @@ fn run() -> Result<ExitCode> {
         },
         Cmd::Release { source_key } => Request::Release { source_key, agent },
         Cmd::Sync { action } => Request::Sync { action },
-        Cmd::Howto { cmd: HowtoCmd::Put { source_key, file } } => {
+        Cmd::Howto { cmd: HowtoCmd::Put { source_key, file, base } } => {
             let content = match file {
                 Some(f) => std::fs::read_to_string(&f)?,
                 None => read_arg_file("-")?,
             };
-            Request::HowtoPut { source_key, content, agent }
+            Request::HowtoPut { source_key, content, agent, base }
         }
-        Cmd::Howto { cmd: HowtoCmd::Get { source_key } } => Request::HowtoGet { source_key },
+        Cmd::Howto { cmd: HowtoCmd::Get { source_key, version } } => Request::HowtoGet { source_key, version },
+        Cmd::Howto { cmd: HowtoCmd::Log { source_key } } => Request::HowtoLog { source_key },
         Cmd::Report { source_key, json, rows_total, rows_new, duration_s, errors, retries, method, howto_version, notes, started_at } => {
             let mut rec: serde_json::Map<String, Value> = match json {
                 Some(spec) => match serde_json::from_str(&read_arg_file(&spec)?)? {

@@ -83,8 +83,17 @@ pub enum Request {
         content: String,
         #[serde(default)]
         agent: Option<String>,
+        /// version (heads) the edit was based on; default = current merged version
+        #[serde(default)]
+        base: Option<String>,
     },
     HowtoGet {
+        source_key: String,
+        /// render a historical version (heads)
+        #[serde(default)]
+        version: Option<String>,
+    },
+    HowtoLog {
         source_key: String,
     },
     Report {
