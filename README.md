@@ -69,7 +69,7 @@ labelsync done "$SRC" --source-file raw_download.csv
 labelsync release "$SRC"
 ```
 
-Exit codes: `0` ok / won, `1` error (`{"ok":false,"error":"…"}`), `2` lost, `3` skip, `4` not claimed (renew).
+Exit codes: `0` ok / won, `1` error (`{"ok":false,"error":"…"}`), `2` lost, `3` skip, `4` not claimed (renew), `5` nothing free (`next`).
 
 Act as a different agent with `--agent NAME` or `LABELSYNC_AGENT`. Each agent name gets its own iroh-docs
 author (signing key), so several agents can share one daemon and still compete fairly for claims.
@@ -90,6 +90,69 @@ if code == 0:
 ```
 
 Check a source before claiming: `labelsync status --source-key "$SRC"` (shows `done`, all claims and the current winner).
+
+## Sharing experience between agents (phase 1.5)
+
+Agents share what works per source: a markdown **playbook** (`howto`), immutable **run reports**, and a
+**shared queue** of sources. `next` uses the run history to pick the source with the best expected yield.
+
+```sh
+labelsync queue add src-a src-b src-c            # or: labelsync queue add --file sources.txt
+labelsync queue list
+labelsync howto put src-a --file playbook.md     # your version (one per agent); stdin works too
+labelsync howto get src-a                        # all versions, newest first: {author, agent, hash, time, content}
+labelsync next [--claim] [--auto-renew]          # exit 0 found/won, 5 nothing free; --sources FILE|- for your own list
+labelsync report src-a --duration-s 540 --errors 2 --retries 5 --method api-v2 --howto-version <hash> --notes "rate limit 5/s"
+echo '{"duration_s":540,"method":"api-v2","rows_total":1200,"rows_new":300}' | labelsync report src-a --json -
+```
+
+`report` fills `rows_total` / `rows_new_after_dedup` automatically from the segments you appended for that
+source since your claim (or since `--started-at`, or `now - duration_s`). Pass them explicitly to override.
+`next` returns `source_key`, `score`, `stats` (`new_per_min`, `error_rate` = errors/run, `last_run_age_s`),
+`best_method`, and `playbook.latest` / `playbook.best` (the version used by the best-yielding run).
+Sources without history get an exploration bonus, so they are tried first.
+
+Agent loop, shell:
+
+```sh
+while out=$(labelsync next --claim --auto-renew); do
+  src=$(jq -r .source_key <<<"$out")
+  jq -r '.playbook.best.content // .playbook.latest.content // ""' <<<"$out" > /tmp/playbook.md
+  hv=$(jq -r '.playbook.best.hash // .playbook.latest.hash // empty' <<<"$out")
+  start=$(date +%s)
+  ./mine.sh "$src" /tmp/playbook.md > labels.tsv            # your miner; TSV with header
+  labelsync append --source-key "$src" < labels.tsv
+  labelsync report "$src" --duration-s $(( $(date +%s) - start )) --method mine.sh-v1 ${hv:+--howto-version "$hv"}
+  labelsync done "$src"
+done   # exits when `next` returns 5 (nothing free)
+```
+
+Python:
+
+```python
+import json, subprocess, time
+def ls(*args, stdin=None):
+    p = subprocess.run(["labelsync", *args], input=stdin, capture_output=True, text=True)
+    return p.returncode, json.loads(p.stdout)
+
+while True:
+    code, n = ls("next", "--claim", "--auto-renew")
+    if code != 0:
+        break                                   # 5 = nothing free
+    src = n["source_key"]
+    pb = (n["playbook"]["best"] or n["playbook"]["latest"] or {})
+    t0, errors = time.time(), 0
+    tsv = mine(src, pb.get("content", ""))      # your code; returns TSV text with header
+    ls("append", "--source-key", src, stdin=tsv)
+    rec = {"duration_s": time.time() - t0, "errors": errors, "method": "py-miner-v1",
+           "howto_version": pb.get("hash"), "notes": "what I learned"}
+    ls("report", src, "--json", "-", stdin=json.dumps(rec))
+    if learned_something:
+        ls("howto", "put", src, stdin=updated_playbook_md)
+    ls("done", src)
+```
+
+SQLite (read-only): `howto`, `runs`, `queue` tables and `source_stats` / `method_stats` views.
 
 ## Input format
 
@@ -176,6 +239,10 @@ Drop files into `<data-dir>/inbox/`. **Write them atomically**: write `name.tsv.
 | `release K` | drop your lease |
 | `sync pause\|resume\|now` | stop / restart network sync (pause also refuses incoming sync connections) |
 | `hash FILE` | BLAKE3 of a file (what `--source-file` computes) |
+| `howto put K [--file F]` / `howto get K` | per-agent markdown playbook for a source |
+| `report K [--json F\|-] [--rows-total N] [--rows-new N] [--duration-s S] [--errors N] [--retries N] [--method M] [--howto-version H] [--notes T] [--started-at T]` | immutable run record |
+| `next [--sources F\|-] [--claim] [--auto-renew] [--ttl-secs N]` | best free source + stats + playbook (exit 5 = none) |
+| `queue add K… [--file F\|-] [--source-url U]` / `queue rm K…` / `queue list` | shared source queue |
 | `stop` | ask the daemon to exit |
 
 Global flags / env: `--data-dir` (`LABELSYNC_DIR`, default `~/.labelsync`), `--socket` (`LABELSYNC_SOCKET`,

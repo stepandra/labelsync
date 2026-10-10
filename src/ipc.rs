@@ -78,5 +78,48 @@ pub enum Request {
         /// pause | resume | now
         action: String,
     },
+    HowtoPut {
+        source_key: String,
+        content: String,
+        #[serde(default)]
+        agent: Option<String>,
+    },
+    HowtoGet {
+        source_key: String,
+    },
+    Report {
+        source_key: String,
+        #[serde(default)]
+        agent: Option<String>,
+        /// run record fields (rows_total, rows_new_after_dedup, duration_s, errors, retries,
+        /// method, howto_version, notes, started_at)
+        record: serde_json::Value,
+    },
+    Next {
+        /// explicit candidate list; None = shared queue in the doc
+        #[serde(default)]
+        sources: Option<Vec<String>>,
+        #[serde(default)]
+        claim: bool,
+        #[serde(default)]
+        agent: Option<String>,
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+        #[serde(default)]
+        auto_renew: bool,
+    },
+    QueueAdd {
+        items: Vec<String>,
+        #[serde(default)]
+        source_url: Option<String>,
+        #[serde(default)]
+        agent: Option<String>,
+    },
+    QueueRm {
+        items: Vec<String>,
+        #[serde(default)]
+        agent: Option<String>,
+    },
+    QueueList,
     Shutdown,
 }

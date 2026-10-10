@@ -23,6 +23,10 @@ and labels do not need concurrent editing.
 | `src/<blake3 of raw source file>` | JSON `{agent, source_key, finished_at}` | the finishing author |
 | `agent/<author hex>` | JSON `{name, node_id, created_at}` | that author (maps author -> agent name) |
 
+| `howto/<enc(source_key)>/` | markdown playbook | one entry per author (latest version per agent) |
+| `runs/<enc(source_key)>/<enc(agent)>/<ts_ms>/` | JSON run record | the reporting author; immutable (new key per run) |
+| `queue/<enc(source_key)>/` | JSON `{agent, added_at, source_url, removed}` | one entry per author; newest entry across authors decides membership |
+
 `enc` = percent-encoding of everything outside `[A-Za-z0-9._~:@+=,-]` (so no `/`). `claim/` and `done/` keys end
 with `/` because iroh-docs deletes same-author entries whose key *starts with* a newly written key (prefix delete).
 Without the terminator `claim/foo` would wipe `claim/foobar`.
@@ -71,6 +75,27 @@ result is duplicate *work*, not duplicate *data* (identical segments share a has
 At most one lease window is wasted. A strict lock would need a single coordinator node (e.g. an irpc `claim` method on an
 always-on node); this is not built.
 
+## Experience sharing (phase 1.5)
+
+* **Playbooks** are plain per-author entries: each agent keeps one markdown version per source, `howto get` lists all
+  of them newest first. The version id is the BLAKE3 content hash of the entry. Old versions stay readable by hash
+  while their blob is in the store (no GC is configured). **Co-editing one playbook with Automerge is a later upgrade**;
+  for now agents read all versions and merge by hand / by LLM.
+* **Run records** are immutable JSON: `rows_total`, `rows_new_after_dedup`, `duration_s`, `errors`, `retries`, `method`,
+  `howto_version`, `notes`, plus `segments`, `started_at`, `ts`, `agent`. If rows are not given, `report` computes them from
+  the reporter's own segments for that source written since the run start (claim time, `--started-at`, or now - duration);
+  "new" = labels that have no provenance from any segment outside that set.
+* All three are mirrored into SQLite (`howto`, `runs`, `queue`) on every materializer pass; `source_stats` and
+  `method_stats` views aggregate runs.
+* **Scoring** (`score.rs`): new labels/min = Σrows_new / Σduration × 60; error rate = errors per run;
+  expected yield = new/min ÷ (1 + error rate). Sources with no usable history get `max(known yield) × 1.25 + 1`
+  (exploration bonus). Ties break by source key.
+* **`next`**: candidates = `--sources` list or the shared queue; drop sources with a `done/` record or a live claim won by
+  someone else; rank; without `--claim` return the best; with `--claim` run the normal claim on each in rank order until one
+  is won. Concurrent `next --claim` can still collide (advisory claims); after sync the loser's `renew` returns lost and its
+  next `next --claim` skips the taken source. `src/<hash>` dedup is not applied in `next` because queue entries carry no
+  raw-file hash.
+
 ## Sync
 
 * `join` imports the ticket's capability and stores the ticket's peer addresses (not the capability) in `state.json`.
@@ -106,3 +131,5 @@ Windows named pipe: TODO.
 * `active_labels` uses correlated subqueries; export of 1M labels takes ~5 s.
 * No per-chain namespaces, no read-only enforcement of SQLite beyond documentation, no metrics endpoint.
 * Phase 3 (generic md/csv file sync) not started.
+* Experience: no Automerge co-editing of playbooks, no per-method playbook link beyond `howto_version`, scoring has no
+  time decay, run records can be faked by any ticket holder, and `next` does not consult `src/` hashes.

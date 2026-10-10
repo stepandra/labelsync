@@ -37,6 +37,8 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tracing::{debug, info, warn};
 
+mod experience;
+
 use crate::{
     claims::{self, ClaimRecord, DoneRecord, Outcome, SrcRecord},
     db, ipc::Request, keys, segment, util,
@@ -413,6 +415,9 @@ impl Node {
                         let (a, n) = (e.author().to_string(), name.to_string());
                         tokio::task::spawn_blocking(move || db::upsert_agent(&db.lock().unwrap(), &a, &n)).await??;
                     }
+        }
+        if let Err(e) = self.materialize_experience(&doc).await {
+            warn!("materialize howto/runs/queue: {e:#}");
         }
         let entries = Self::collect(&doc, Query::key_prefix(keys::SEG).build()).await?;
         let db = self.db.clone();
@@ -1027,6 +1032,21 @@ impl Node {
             }
             Request::Release { source_key, agent } => self.release(self.agent_or_default(&agent), source_key).await,
             Request::Sync { action } => self.sync_cmd(&action).await,
+            Request::HowtoPut { source_key, content, agent } => {
+                self.howto_put(self.agent_or_default(&agent), source_key, content).await
+            }
+            Request::HowtoGet { source_key } => self.howto_get(source_key).await,
+            Request::Report { source_key, agent, record } => {
+                self.report(self.agent_or_default(&agent), source_key, record).await
+            }
+            Request::Next { sources, claim, agent, ttl_secs, auto_renew } => {
+                self.next(self.agent_or_default(&agent), sources, claim, ttl_secs, auto_renew).await
+            }
+            Request::QueueAdd { items, source_url, agent } => {
+                self.queue_set(self.agent_or_default(&agent), items, source_url, false).await
+            }
+            Request::QueueRm { items, agent } => self.queue_set(self.agent_or_default(&agent), items, None, true).await,
+            Request::QueueList => self.queue_list().await,
             Request::Shutdown => {
                 self.shutdown.notify_one();
                 Ok(json!({"ok": true, "shutting_down": true}))

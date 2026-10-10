@@ -59,6 +59,54 @@ CREATE TABLE IF NOT EXISTS provenance(
   eff_at INTEGER NOT NULL,
   PRIMARY KEY(label_id, author_id, segment_id, op, category, observed_at)
 ) WITHOUT ROWID;
+-- experience sharing (phase 1.5)
+CREATE TABLE IF NOT EXISTS howto(
+  source_key TEXT NOT NULL,
+  author TEXT NOT NULL,
+  hash TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  PRIMARY KEY(source_key, author)
+);
+CREATE TABLE IF NOT EXISTS runs(
+  key TEXT PRIMARY KEY,
+  author TEXT NOT NULL,
+  source_key TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  rows_total INTEGER,
+  rows_new INTEGER,
+  duration_s REAL,
+  errors INTEGER,
+  retries INTEGER,
+  method TEXT,
+  howto_version TEXT,
+  notes TEXT,
+  json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS runs_source ON runs(source_key, method);
+CREATE TABLE IF NOT EXISTS queue(
+  source_key TEXT NOT NULL,
+  author TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  removed INTEGER NOT NULL,
+  source_url TEXT,
+  PRIMARY KEY(source_key, author)
+);
+CREATE VIEW IF NOT EXISTS source_stats AS
+  SELECT source_key, count(*) AS runs, sum(COALESCE(rows_total,0)) AS rows_total,
+    sum(COALESCE(rows_new,0)) AS rows_new, sum(COALESCE(duration_s,0)) AS duration_s,
+    sum(COALESCE(errors,0)) AS errors, sum(COALESCE(retries,0)) AS retries, max(ts) AS last_ts,
+    CASE WHEN sum(COALESCE(duration_s,0)) > 0 THEN sum(COALESCE(rows_new,0)) * 60.0 / sum(duration_s) END AS new_per_min,
+    sum(COALESCE(errors,0)) * 1.0 / count(*) AS error_rate
+  FROM runs GROUP BY source_key;
+CREATE VIEW IF NOT EXISTS method_stats AS
+  SELECT source_key, COALESCE(method,'') AS method, count(*) AS runs, sum(COALESCE(rows_total,0)) AS rows_total,
+    sum(COALESCE(rows_new,0)) AS rows_new, sum(COALESCE(duration_s,0)) AS duration_s,
+    sum(COALESCE(errors,0)) AS errors, sum(COALESCE(retries,0)) AS retries, max(ts) AS last_ts,
+    CASE WHEN sum(COALESCE(duration_s,0)) > 0 THEN sum(COALESCE(rows_new,0)) * 60.0 / sum(duration_s) END AS new_per_min,
+    sum(COALESCE(errors,0)) * 1.0 / count(*) AS error_rate
+  FROM runs GROUP BY source_key, COALESCE(method,'');
 CREATE VIEW IF NOT EXISTS provenance_v AS
   SELECT l.chain, l.address, l.label_source, l.label, p.op, p.category,
          COALESCE(a.name, substr(a.author,1,12)) AS agent, a.author, s.source_key,
@@ -240,6 +288,154 @@ pub fn agent_name(conn: &Connection, author: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row("SELECT name FROM authors WHERE author=?1", [author], |r| r.get::<_, Option<String>>(0))
         .optional()?.flatten())
+}
+
+// ---------- experience sharing ----------
+
+pub fn upsert_howto(conn: &Connection, source_key: &str, author: &str, hash: &str, ts: u64, content: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO howto(source_key,author,hash,ts,content) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(source_key,author) DO UPDATE SET hash=excluded.hash, ts=excluded.ts, content=excluded.content
+         WHERE excluded.ts >= howto.ts",
+        params![source_key, author, hash, ts as i64, content],
+    )?;
+    Ok(())
+}
+
+pub fn howto_hash(conn: &Connection, source_key: &str, author: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row("SELECT hash FROM howto WHERE source_key=?1 AND author=?2", [source_key, author], |r| r.get(0))
+        .optional()?)
+}
+
+pub fn run_keys(conn: &Connection) -> Result<HashSet<String>> {
+    let mut st = conn.prepare("SELECT key FROM runs")?;
+    let v = st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
+pub fn insert_run(conn: &Connection, key: &str, author: &str, rec: &serde_json::Value) -> Result<()> {
+    let i = |k: &str| rec.get(k).and_then(|v| v.as_f64()).map(|f| f as i64);
+    let f = |k: &str| rec.get(k).and_then(|v| v.as_f64());
+    let t = |k: &str| rec.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    conn.execute(
+        "INSERT OR IGNORE INTO runs(key,author,source_key,agent,ts,rows_total,rows_new,duration_s,errors,retries,method,howto_version,notes,json)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![
+            key, author, t("source_key").unwrap_or_default(), t("agent").unwrap_or_default(), i("ts").unwrap_or(0),
+            i("rows_total"), i("rows_new_after_dedup"), f("duration_s"), i("errors"), i("retries"),
+            t("method"), t("howto_version"), t("notes"), rec.to_string()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_queue(conn: &Connection, source_key: &str, author: &str, ts: u64, removed: bool, url: Option<&str>) -> Result<()> {
+    conn.execute(
+        "INSERT INTO queue(source_key,author,ts,removed,source_url) VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(source_key,author) DO UPDATE SET ts=excluded.ts, removed=excluded.removed, source_url=excluded.source_url
+         WHERE excluded.ts >= queue.ts",
+        params![source_key, author, ts as i64, removed as i64, url],
+    )?;
+    Ok(())
+}
+
+/// Active queue: sources whose newest queue entry (across authors) is not a removal.
+pub fn queue_list(conn: &Connection) -> Result<Vec<(String, Option<String>)>> {
+    let mut st = conn.prepare(
+        "SELECT q.source_key, (SELECT source_url FROM queue u WHERE u.source_key=q.source_key AND u.source_url IS NOT NULL ORDER BY ts DESC LIMIT 1)
+         FROM queue q GROUP BY q.source_key
+         HAVING (SELECT removed FROM queue z WHERE z.source_key=q.source_key ORDER BY ts DESC LIMIT 1) = 0
+         ORDER BY min(q.ts), q.source_key",
+    )?;
+    let v = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
+fn agg_from_row(r: &rusqlite::Row) -> rusqlite::Result<crate::score::Agg> {
+    Ok(crate::score::Agg {
+        runs: r.get::<_, i64>("runs")? as u64,
+        rows_total: r.get::<_, f64>("rows_total")?,
+        rows_new: r.get::<_, f64>("rows_new")?,
+        duration_s: r.get::<_, f64>("duration_s")?,
+        errors: r.get::<_, f64>("errors")?,
+        retries: r.get::<_, f64>("retries")?,
+        last_ts_ms: r.get::<_, i64>("last_ts")? as u64,
+    })
+}
+
+pub fn source_agg(conn: &Connection, source_key: &str) -> Result<Option<crate::score::Agg>> {
+    Ok(conn
+        .query_row("SELECT * FROM source_stats WHERE source_key=?1", [source_key], agg_from_row)
+        .optional()?)
+}
+
+pub fn method_aggs(conn: &Connection, source_key: &str) -> Result<Vec<(String, crate::score::Agg)>> {
+    let mut st = conn.prepare("SELECT * FROM method_stats WHERE source_key=?1 ORDER BY method")?;
+    let v = st
+        .query_map([source_key], |r| Ok((r.get::<_, String>("method")?, agg_from_row(r)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
+/// howto_version used by the run with the best new-labels-per-minute for this source.
+pub fn best_howto_version(conn: &Connection, source_key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT howto_version FROM runs WHERE source_key=?1 AND howto_version IS NOT NULL AND duration_s > 0
+             ORDER BY COALESCE(rows_new,0) * 1.0 / duration_s DESC, ts DESC LIMIT 1",
+            [source_key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn howto_by_hash(conn: &Connection, hash: &str) -> Result<Option<(String, String, i64, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT h.author, COALESCE(a.name,''), h.ts, h.content FROM howto h LEFT JOIN authors a ON a.author=h.author WHERE h.hash=?1 LIMIT 1",
+            [hash],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn latest_howto(conn: &Connection, source_key: &str) -> Result<Option<(String, String, String, i64, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT h.author, COALESCE(a.name,''), h.hash, h.ts, h.content FROM howto h LEFT JOIN authors a ON a.author=h.author
+             WHERE h.source_key=?1 ORDER BY h.ts DESC LIMIT 1",
+            [source_key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?)
+}
+
+/// Rows contributed by `author` to `source_key` in segments written at/after `since_ms`:
+/// (segment keys, rows_total, rows_new_after_dedup). "New" = labels with no provenance from any other segment.
+pub fn run_rows(conn: &Connection, source_key: &str, author: &str, since_ms: u64) -> Result<(Vec<String>, i64, i64)> {
+    let mut st = conn.prepare(
+        "SELECT s.id, s.key, s.rows FROM segments s JOIN authors a ON a.id=s.author_id
+         WHERE s.source_key=?1 AND a.author=?2 AND s.entry_ts >= ?3 ORDER BY s.key",
+    )?;
+    let segs: Vec<(i64, String, i64)> = st
+        .query_map(params![source_key, author, since_ms as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    if segs.is_empty() {
+        return Ok((vec![], 0, 0));
+    }
+    let ids = segs.iter().map(|s| s.0.to_string()).collect::<Vec<_>>().join(",");
+    let total: i64 = segs.iter().map(|s| s.2).sum();
+    let new: i64 = conn.query_row(
+        &format!(
+            "SELECT count(DISTINCT p.label_id) FROM provenance p WHERE p.segment_id IN ({ids}) AND p.op='add'
+             AND NOT EXISTS (SELECT 1 FROM provenance q WHERE q.label_id=p.label_id AND q.segment_id NOT IN ({ids}))"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok((segs.into_iter().map(|s| s.1).collect(), total, new))
 }
 
 #[cfg(test)]

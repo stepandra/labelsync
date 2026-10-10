@@ -5,5 +5,6 @@ pub mod db;
 pub mod ipc;
 pub mod keys;
 pub mod norm;
+pub mod score;
 pub mod segment;
 pub mod util;

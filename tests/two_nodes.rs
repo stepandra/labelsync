@@ -267,7 +267,79 @@ fn two_daemons_end_to_end() {
     eprintln!("[info] post-partition renew: A={} B={}", va["result"], vb["result"]);
     assert_eq!([&va, &vb].iter().filter(|v| v["result"] == "won").count(), 1);
 
+    // ---- 7. experience sharing: howto + report on A, visible to B and returned by `next` ----
+    a.cli_stdin(&["howto", "put", "q-known"], Some("# q-known playbook\nUse the csv export endpoint, 1 req/s.\n"));
+    let hv = a.cli(&["howto", "get", "q-known"])["versions"][0]["hash"].as_str().unwrap().to_string();
+    assert_eq!(a.cli(&["claim", "q-known"])["result"], "won");
+    a.cli_stdin(
+        &["append", "--source-key", "q-known", "--chain", "eth"],
+        Some("address\tlabel\n0x4444444444444444444444444444444444444444\tL4\n0x5555555555555555555555555555555555555555\tL5\n"),
+    );
+    let rep = a.cli(&["report", "q-known", "--duration-s", "30", "--errors", "1", "--method", "csv-export", "--howto-version", &hv]);
+    assert_eq!(rep["run"]["rows_total"], 2, "{rep}");
+    assert_eq!(rep["run"]["rows_new_after_dedup"], 2, "{rep}");
+    assert_eq!(rep["run"]["rows_computed"], true);
+    a.cli(&["release", "q-known"]);
+    a.cli(&["queue", "add", "q-known"]);
+    let last = std::cell::RefCell::new(Value::Null);
+    wait_until_dbg("B sees howto + run and `next` returns them", 60, || {
+        let h = b.cli(&["howto", "get", "q-known"]);
+        let (code, n) = b.try_cli(&["next"]);
+        *last.borrow_mut() = n.clone();
+        h["versions"].as_array().map(|v| v.len()) == Some(1)
+            && code == Some(0)
+            && n["source_key"] == "q-known"
+            && n["best_method"]["method"] == "csv-export"
+            && n["stats"]["runs"] == 1
+            && n["playbook"]["best"]["hash"] == hv.as_str()
+            && n["playbook"]["latest"]["content"].as_str().unwrap_or("").contains("csv export")
+    }, || last.borrow().to_string());
+    let n = last.borrow().clone();
+    eprintln!("[info] next on B: source={} score={} new_per_min={} best_method={}", n["source_key"], n["score"], n["stats"]["new_per_min"], n["best_method"]["method"]);
+    a.cli(&["queue", "rm", "q-known"]);
+
+    // ---- 8. concurrent `next --claim` on a 2-item queue -> different sources after renew settles ----
+    a.cli(&["queue", "add", "qa-1", "qa-2"]);
+    wait_until("B sees 2-item queue", 60, || b.cli(&["queue", "list"])["queue"].as_array().map(|q| q.len()) == Some(2));
+    let (na, nb) = thread::scope(|s| {
+        let ha = s.spawn(|| a.try_cli(&["next", "--claim"]));
+        let hb = s.spawn(|| b.try_cli(&["next", "--claim"]));
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+    let mut sa = na.1["source_key"].as_str().unwrap().to_string();
+    let mut sb = nb.1["source_key"].as_str().unwrap().to_string();
+    eprintln!("[info] concurrent next --claim: A->{sa} B->{sb}");
+    let settled = |src: &str| {
+        let x = a.cli(&["status", "--source-key", src]);
+        let y = b.cli(&["status", "--source-key", src]);
+        x["source"]["claims"] == y["source"]["claims"]
+    };
+    wait_until("claims settled on both nodes", 60, || settled("qa-1") && settled("qa-2"));
+    for _ in 0..3 {
+        let ra = a.try_cli(&["renew", &sa]).1;
+        let rb = b.try_cli(&["renew", &sb]).1;
+        if ra["result"] == "won" && rb["result"] == "won" && sa != sb {
+            break;
+        }
+        // the loser asks for another source
+        if ra["result"] != "won" {
+            sa = a.cli(&["next", "--claim"])["source_key"].as_str().unwrap_or("").to_string();
+        }
+        if rb["result"] != "won" {
+            sb = b.cli(&["next", "--claim"])["source_key"].as_str().unwrap_or("").to_string();
+        }
+        wait_until("claims settled again", 60, || settled("qa-1") && settled("qa-2"));
+    }
+    eprintln!("[info] after renew settles: A->{sa} B->{sb}");
+    assert_ne!(sa, sb);
+    assert_eq!(a.try_cli(&["renew", &sa]).1["result"], "won");
+    assert_eq!(b.try_cli(&["renew", &sb]).1["result"], "won");
+    // queue exhausted for a third agent-view: nothing free for A except what A holds
+    let (code, _v) = b.try_cli(&["--agent", "third", "next"]);
+    assert_eq!(code, Some(5), "no free source left: {_v}");
+
     // ---- 6. restart persistence ----
+    let expected = b.labels().0;
     drop(b);
     let b = Daemon::start(&root, "hound-b", &[]);
     assert_eq!(b.labels().0, expected, "B keeps its DB across restart");

@@ -124,10 +124,98 @@ enum Cmd {
     Release { source_key: String },
     /// pause | resume | now
     Sync { action: String },
+    /// Shared per-source playbooks (markdown, one version per agent)
+    Howto {
+        #[command(subcommand)]
+        cmd: HowtoCmd,
+    },
+    /// Publish an immutable run record for a source (JSON via --json FILE|- and/or flags)
+    Report {
+        source_key: String,
+        /// Read a JSON object with the fields below from FILE or - (stdin); flags override
+        #[arg(long)]
+        json: Option<String>,
+        #[arg(long)]
+        rows_total: Option<u64>,
+        /// Default: computed from your segments for this source since the run started
+        #[arg(long)]
+        rows_new: Option<u64>,
+        #[arg(long)]
+        duration_s: Option<f64>,
+        #[arg(long)]
+        errors: Option<u64>,
+        #[arg(long)]
+        retries: Option<u64>,
+        #[arg(long)]
+        method: Option<String>,
+        /// Hash of the playbook version used (from `howto get` / `next`)
+        #[arg(long)]
+        howto_version: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        /// Run start (unix s/ms or RFC3339). Default: your claim time, else now - duration
+        #[arg(long)]
+        started_at: Option<String>,
+    },
+    /// Pick the next free source by expected yield. Exit: 0 found/won, 5 nothing available
+    Next {
+        /// Candidate list (one source_key per line) from FILE or - (stdin). Default: shared queue
+        #[arg(long)]
+        sources: Option<String>,
+        /// Claim it (tries the next candidate if the claim is lost)
+        #[arg(long)]
+        claim: bool,
+        #[arg(long)]
+        auto_renew: bool,
+        #[arg(long)]
+        ttl_secs: Option<u64>,
+    },
+    /// Shared source queue in the namespace
+    Queue {
+        #[command(subcommand)]
+        cmd: QueueCmd,
+    },
     /// Ask the daemon to exit
     Stop,
     /// Print the BLAKE3 hash of a file (for --source-hash)
     Hash { file: PathBuf },
+}
+
+#[derive(Subcommand, Debug)]
+enum HowtoCmd {
+    /// Store your playbook for a source (from --file or stdin)
+    Put {
+        source_key: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// All versions, newest first
+    Get { source_key: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum QueueCmd {
+    /// Add source keys (args, or one per line from --file FILE|-)
+    Add {
+        items: Vec<String>,
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        source_url: Option<String>,
+    },
+    /// Remove source keys from the shared queue
+    Rm { items: Vec<String> },
+    List,
+}
+
+fn read_arg_file(spec: &str) -> Result<String> {
+    if spec == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        Ok(std::fs::read_to_string(spec).with_context(|| format!("reading {spec}"))?)
+    }
 }
 
 fn default_data_dir() -> PathBuf {
@@ -194,6 +282,7 @@ fn exit_for(v: &Value) -> ExitCode {
         Some("lost") => ExitCode::from(2),
         Some("skip") => ExitCode::from(3),
         Some("not_claimed") => ExitCode::from(4),
+        Some("none") => ExitCode::from(5),
         _ => ExitCode::SUCCESS,
     }
 }
@@ -304,6 +393,57 @@ fn run() -> Result<ExitCode> {
         },
         Cmd::Release { source_key } => Request::Release { source_key, agent },
         Cmd::Sync { action } => Request::Sync { action },
+        Cmd::Howto { cmd: HowtoCmd::Put { source_key, file } } => {
+            let content = match file {
+                Some(f) => std::fs::read_to_string(&f)?,
+                None => read_arg_file("-")?,
+            };
+            Request::HowtoPut { source_key, content, agent }
+        }
+        Cmd::Howto { cmd: HowtoCmd::Get { source_key } } => Request::HowtoGet { source_key },
+        Cmd::Report { source_key, json, rows_total, rows_new, duration_s, errors, retries, method, howto_version, notes, started_at } => {
+            let mut rec: serde_json::Map<String, Value> = match json {
+                Some(spec) => match serde_json::from_str(&read_arg_file(&spec)?)? {
+                    Value::Object(m) => m,
+                    _ => return Err(anyhow!("--json must contain a JSON object")),
+                },
+                None => Default::default(),
+            };
+            // accept rows_new as an alias in JSON input
+            if let Some(v) = rec.remove("rows_new") {
+                rec.entry("rows_new_after_dedup").or_insert(v);
+            }
+            let mut set = |k: &str, v: Option<Value>| {
+                if let Some(v) = v {
+                    rec.insert(k.into(), v);
+                }
+            };
+            set("rows_total", rows_total.map(|x| json!(x)));
+            set("rows_new_after_dedup", rows_new.map(|x| json!(x)));
+            set("duration_s", duration_s.map(|x| json!(x)));
+            set("errors", errors.map(|x| json!(x)));
+            set("retries", retries.map(|x| json!(x)));
+            set("method", method.map(|x| json!(x)));
+            set("howto_version", howto_version.map(|x| json!(x)));
+            set("notes", notes.map(|x| json!(x)));
+            set("started_at", started_at.map(|x| json!(x)));
+            Request::Report { source_key, agent, record: Value::Object(rec) }
+        }
+        Cmd::Next { sources, claim, auto_renew, ttl_secs } => {
+            let sources = match sources {
+                Some(spec) => Some(read_arg_file(&spec)?.lines().map(|l| l.to_string()).collect()),
+                None => None,
+            };
+            Request::Next { sources, claim, agent, ttl_secs, auto_renew }
+        }
+        Cmd::Queue { cmd: QueueCmd::Add { mut items, file, source_url } } => {
+            if let Some(spec) = file {
+                items.extend(read_arg_file(&spec)?.lines().map(|l| l.to_string()));
+            }
+            Request::QueueAdd { items, source_url, agent }
+        }
+        Cmd::Queue { cmd: QueueCmd::Rm { items } } => Request::QueueRm { items, agent },
+        Cmd::Queue { cmd: QueueCmd::List } => Request::QueueList,
         Cmd::Stop => Request::Shutdown,
     };
     let v = call(&socket, &req)?;

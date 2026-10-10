@@ -16,6 +16,9 @@ pub const CLAIM: &str = "claim/";
 pub const DONE: &str = "done/";
 pub const SRC: &str = "src/";
 pub const AGENT: &str = "agent/";
+pub const HOWTO: &str = "howto/";
+pub const RUNS: &str = "runs/";
+pub const QUEUE: &str = "queue/";
 
 fn keep(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"._~:@+=,-".contains(&b)
@@ -106,6 +109,30 @@ pub fn src_key(hash_hex: &str) -> String {
     format!("{SRC}{}", hash_hex.to_ascii_lowercase())
 }
 
+pub fn howto_key(source_key: &str) -> String {
+    format!("{HOWTO}{}/", enc(source_key))
+}
+
+pub fn queue_key(source_key: &str) -> String {
+    format!("{QUEUE}{}/", enc(source_key))
+}
+
+pub fn run_key(source_key: &str, agent: &str, ts_ms: u64) -> String {
+    format!("{RUNS}{}/{}/{ts_ms}/", enc(source_key), enc(agent))
+}
+
+/// `runs/<enc src>/<enc agent>/<ts>/` -> (source_key, agent, ts)
+pub fn parse_run_key(key: &[u8]) -> Option<(String, String, u64)> {
+    let s = std::str::from_utf8(key).ok()?;
+    let rest = s.strip_prefix(RUNS)?.strip_suffix('/')?;
+    let mut p = rest.split('/');
+    let (src, agent, ts) = (p.next()?, p.next()?, p.next()?);
+    if p.next().is_some() {
+        return None;
+    }
+    Some((dec(src), dec(agent), ts.parse().ok()?))
+}
+
 pub fn agent_key(author_hex: &str) -> String {
     format!("{AGENT}{author_hex}")
 }
@@ -129,6 +156,13 @@ mod tests {
         let b = claim_key("foobar");
         assert!(!b.starts_with(&a));
         assert_eq!(parse_claim_or_done_key(b.as_bytes(), CLAIM).unwrap(), "foobar");
+    }
+
+    #[test]
+    fn run_key_parse() {
+        let k = run_key("a/b", "hound a", 123);
+        assert_eq!(parse_run_key(k.as_bytes()).unwrap(), ("a/b".into(), "hound a".into(), 123));
+        assert!(!howto_key("x").starts_with(&howto_key("xy")) && !howto_key("xy").starts_with(&howto_key("x")));
     }
 
     #[test]
