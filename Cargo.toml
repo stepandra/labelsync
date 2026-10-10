@@ -1,6 +1,6 @@
 [package]
 name = "labelsync"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,7 +8,9 @@ anyhow = "1.0.104"
 automerge = "0.12"
 blake3 = "1.8.7"
 bytes = "1.12.1"
-clap = { version = "4.6.7", features = ["derive", "env"] }
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
 csv = "1.4.0"
 dissimilar = "1.0.11"
 futures-lite = "2.6.1"
@@ -35,3 +37,6 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+[dev-dependencies]
+tempfile = "3.27.0"

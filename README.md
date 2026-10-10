@@ -16,7 +16,7 @@ See [DESIGN.md](DESIGN.md) for the internals.
 
 ```sh
 # Rust >= 1.91
-cargo build --release            # -> target/release/labelsync (glibc, ~22 MB stripped)
+cargo build --release            # -> target/release/labelsync (glibc, ~25 MB stripped)
 # fully static Linux binary (needs musl-tools):
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
@@ -28,7 +28,7 @@ Copy the single binary to every machine that runs agents.
 
 ```sh
 # machine A
-labelsync --agent hound-a daemon &              # data in ~/.labelsync (override: --data-dir / LABELSYNC_DIR)
+labelsync --agent hound-a daemon &              # data in ~/.local/share/labelsync (see `labelsync config`)
 labelsync share --out ~/labelsync.ticket        # write ticket, file mode 0600
 
 # copy the ticket file to machine B over a trusted channel, then:
@@ -69,7 +69,7 @@ labelsync done "$SRC" --source-file raw_download.csv
 labelsync release "$SRC"
 ```
 
-Exit codes: `0` ok / won, `1` error (`{"ok":false,"error":"…"}`), `2` lost, `3` skip, `4` not claimed (renew), `5` nothing free (`next`).
+Exit codes: `0` ok / won, `1` error (`{"ok":false,"error":"…","code":"…"}`), `2` lost, `3` skip, `4` not claimed (renew), `5` nothing free (`next`), `64` usage error. See [CLI contract](#cli-contract).
 
 Act as a different agent with `--agent NAME` or `LABELSYNC_AGENT`. Each agent name gets its own iroh-docs
 author (signing key), so several agents can share one daemon and still compete fairly for claims.
@@ -220,7 +220,7 @@ Drop files into `<data-dir>/inbox/`. **Write them atomically**: write `name.tsv.
 ## Reading the data
 
 * SQLite: `<data-dir>/labels.db`. The daemon is the only writer; open it **read-only**:
-  `sqlite3 'file:/home/me/.labelsync/labels.db?mode=ro' "select * from active_labels where address='0x…'"`.
+  `sqlite3 'file:/home/me/.local/share/labelsync/labels.db?mode=ro' "select * from active_labels where address='0x…'"`.
   * `active_labels(id, chain, address, label_source, label, category, agents, first_seen, last_seen)`: what you normally want
   * `labels`: every label identity ever seen, revoked ones included
   * `provenance_v(chain, address, label_source, label, op, category, agent, author, source_key, observed_at, eff_at, segment)`: who said what, when
@@ -239,7 +239,7 @@ Drop files into `<data-dir>/inbox/`. **Write them atomically**: write `name.tsv.
 | `daemon [--ttl-secs 2700] [--sync-interval 30] [--segment-rows 50000] [--start-paused] [--auto-export]` | run the node in the foreground (logs to stderr, `LABELSYNC_LOG` = tracing filter) |
 | `share [--read-only] [--addr all\|relay\|direct\|id] [--out FILE]` | print or save a ticket |
 | `join <ticket\|@file\|->  [--force]` | join a namespace (refuses to abandon a namespace that already holds data unless `--force`) |
-| `append [--source-key K] [--chain C] [--label-source S] [--observed-at T] [--format auto\|tsv\|csv\|jsonl] [--file F]` | ingest from stdin or a file |
+| `append [--source-key K] [--chain C] [--label-source S] [--observed-at T] [--format auto\|tsv\|csv\|jsonl] [--file F] [--dry-run]` | ingest from stdin or a file (`--dry-run`: validate locally, show segments, write nothing) |
 | `export [--chain C] [--out-dir D]` | per-chain TSV |
 | `status [--source-key K]` | node id, namespace, peers, DB counts, active claims (or one source's claims/done) |
 | `claim K [--source-url U] [--source-hash H \| --source-file F] [--ttl-secs N] [--auto-renew]` | take a lease |
@@ -253,9 +253,48 @@ Drop files into `<data-dir>/inbox/`. **Write them atomically**: write `name.tsv.
 | `next [--sources F\|-] [--claim] [--auto-renew] [--ttl-secs N]` | best free source + stats + playbook (exit 5 = none) |
 | `queue add K… [--file F\|-] [--source-url U]` / `queue rm K…` / `queue list` | shared source queue |
 | `stop` | ask the daemon to exit |
+| `config` | effective client config and where each value came from (flag / env / default) |
+| `capabilities` | JSON inventory of commands, flags, env vars, exit codes (for agents; no help scraping) |
+| `completions bash\|zsh\|fish\|elvish\|powershell` | shell completion script on stdout |
+| `man` | man page (roff) on stdout |
 
-Global flags / env: `--data-dir` (`LABELSYNC_DIR`, default `~/.labelsync`), `--socket` (`LABELSYNC_SOCKET`,
-default `<data-dir>/labelsync.sock`; keep the path under ~100 chars), `--agent` (`LABELSYNC_AGENT`, default: hostname).
+`labelsync --help`, `labelsync help CMD` and `labelsync CMD --help` show usage, every flag with defaults/env, and examples.
+
+Global flags / env (precedence: flag > env > default; there is no config file):
+
+| flag | env | default |
+|---|---|---|
+| `--data-dir DIR` | `LABELSYNC_DIR` | `~/.labelsync` if it exists (pre-0.2 installs), else `$XDG_DATA_HOME/labelsync` (`~/.local/share/labelsync`) |
+| `--socket PATH` | `LABELSYNC_SOCKET` | `<data-dir>/labelsync.sock` (keep under ~100 chars) |
+| `--agent NAME` | `LABELSYNC_AGENT` | hostname |
+| `--output json\|text` | `LABELSYNC_OUTPUT` | `json` |
+| `--timeout SECS` | `LABELSYNC_TIMEOUT` | `300` (how long the CLI waits for the daemon) |
+| `-q, --quiet` | | off: suppress warnings/hints on stderr; daemon logs warnings only |
+| `--verbose` | | off: daemon debug logging (`LABELSYNC_LOG` tracing filter wins) |
+| `--no-input` | | accepted no-op: labelsync never prompts |
+
+## CLI contract
+
+* **stdout** is the result: exactly one JSON object per invocation (`--output json`, the default), or
+  `key: value` lines with `--output text` (for people; not stable). Help, version, `completions` and `man` print
+  their text on stdout.
+* **stderr** carries diagnostics only: daemon logs, warnings (`labelsync: warning: …`), and on failure
+  `labelsync: error: <what failed>` plus `hint: <how to recover>`. Colors only on a TTY; `NO_COLOR` and
+  `TERM=dumb` are honored.
+* **Failures** in JSON mode also print `{"ok":false,"error":"…","code":"…","hint":…,"exit":N}` on stdout, so
+  agents always get one parseable value. Codes: `daemon_unreachable`, `timeout`, `no_input`, `bad_input`,
+  `daemon_error`, `error`.
+* **Exit codes**: `0` ok / won / found · `1` error · `2` lost · `3` skip (done or same raw file seen) ·
+  `4` not claimed (`renew`) · `5` nothing free (`next`) · `64` usage error (bad flag/arg, unknown command,
+  invalid `--json` input, data expected on stdin but stdin is a terminal).
+* Commands that read stdin (`append`, `howto put`, `join -`, `--json -`, `--sources -`, `--file -`) refuse to
+  wait on an interactive terminal and exit 64 instead.
+* `join TICKET` with the ticket in argv works but warns (shell history / `ps`); prefer `join @FILE` or `join -`.
+
+Compatibility notes (v0.2 CLI audit): usage errors used to exit `2` (clap's default), which collided with
+"lost"; they now exit `64`. Invalid `report --json` input now exits `64` instead of `1`. Error objects gained
+`code`, `hint` and `exit` fields; all existing fields and success outputs are unchanged. Fresh installs use the
+XDG data dir; an existing `~/.labelsync` keeps being used.
 
 ## Data directory
 

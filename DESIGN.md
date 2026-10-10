@@ -150,3 +150,12 @@ Windows named pipe: TODO.
 * Phase 3 (generic md/csv file sync) not started.
 * Experience: scoring has no time decay, run records can be faked by any ticket holder, `next` does not consult `src/`
   hashes, playbook blobs are never compacted/GC'd, no `howto edit` ($EDITOR) helper.
+
+## CLI layer (v0.2 audit against the engineering-cli-tools standard)
+
+`src/main.rs` is the only process boundary: clap parses (help/version/usage errors never touch the daemon or
+disk), commands become one `ipc::Request`, and `emit` renders the daemon's JSON either as the stable JSON
+contract (default) or as `key: value` text, writing error message + hint to stderr. Exit codes are mapped in one
+place (`exit_code_for`, unit-tested); usage errors exit 64 so they can't be confused with "lost" (2). The
+client waits at most `--timeout` for the daemon. `capabilities` is generated from the same clap metadata as
+help, completions and the man page, so they can't drift. Contract tests: `tests/cli.rs`.

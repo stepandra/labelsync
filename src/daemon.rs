@@ -118,6 +118,7 @@ pub struct Node {
     agents_published: Mutex<BTreeSet<(NamespaceId, AuthorId)>>,
     default_author: AuthorId,
     shutdown: Notify,
+    stopping: AtomicBool,
     pending_blobs: AtomicU64,
 }
 
@@ -201,6 +202,7 @@ impl Node {
             agents_published: Mutex::new(BTreeSet::new()),
             default_author,
             shutdown: Notify::new(),
+            stopping: AtomicBool::new(false),
             pending_blobs: AtomicU64::new(0),
         });
 
@@ -385,6 +387,7 @@ impl Node {
                     }
                 }
                 Ok(_) => {}
+                Err(_) if self.stopping.load(Ordering::Relaxed) => return,
                 Err(e) => warn!("materialize failed: {e:#}"),
             }
         }
@@ -1059,6 +1062,7 @@ impl Node {
 
     async fn shutdown_all(&self) {
         info!("shutting down");
+        self.stopping.store(true, Ordering::Relaxed);
         if let Err(e) = self.router.shutdown().await {
             warn!("router shutdown: {e}");
         }
